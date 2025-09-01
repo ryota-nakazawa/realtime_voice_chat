@@ -15,10 +15,12 @@ app.post("/token", async (_req, res) => {
         "Content-Type": "application/json",
         "OpenAI-Beta": "realtime=v1"
       },
-      body: JSON.stringify({
+  body: JSON.stringify({
         model: "gpt-4o-realtime-preview",
         voice: "alloy",
-        modalities: ["audio", "text"]
+        modalities: ["audio", "text"],
+        // 話し終わりの無音を検出して自動で応答を開始
+        turn_detection: { type: "server_vad", silence_duration_ms: 700 }
       })
     });
     if (!r.ok) {
