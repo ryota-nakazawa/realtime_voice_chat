@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>OpenAI Realtime (WebRTC) - Toggle Start/Stop</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 24px; }
+    button { font-size: 16px; padding: 10px 16px; }
+    .status { margin-top: 12px; color: #444; }
+  </style>
+</head>
+<body>
+  <button id="toggle">▶ Start</button>
+  <div class="status" id="status">Idle</div>
+
+  <script>
+    const btn = document.getElementById("toggle");
+    const statusEl = document.getElementById("status");
+
+    // グローバル状態
+    let pc = null;                // RTCPeerConnection
+    let dc = null;                // DataChannel
+    let micStream = null;         // getUserMediaで取得したストリーム
+    let remoteAudio = null;       // 受信用 <audio> 要素
+    let running = false;          // 現在の接続状態
+    let cleaning = false;         // 二重停止の防止
+
+    function setStatus(t) { statusEl.textContent = t; }
+    function setRunningState(on) {
+      running = on;
+      btn.textContent = on ? "■ Stop" : "▶ Start";
+      setStatus(on ? "Connected" : "Idle");
+    }
+
+    async function fetchEphemeralSession() {
+      const r = await fetch("/token", { method: "POST" });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json(); // { client_secret: { value: "..." }, ... }
+    }
+
+    async function startSession() {
+      if (running) return;
+      setStatus("Starting...");
+      btn.disabled = true;
+
+      try {
+        // 1) マイク取得
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // 2) Ephemeral token 取得
+        const session = await fetchEphemeralSession();
+
+        // 3) PeerConnection 準備
+        pc = new RTCPeerConnection();
+        micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
+
+        // 4) 受信音声
+        pc.ontrack = (e) => {
+          // 既存のaudioがあれば消す（再接続時の重複防止）
+          if (remoteAudio) {
+            try { remoteAudio.pause(); } catch {}
+            remoteAudio.remove();
+            remoteAudio = null;
+          }
+          remoteAudio = document.createElement("audio");
+          remoteAudio.autoplay = true;
+          remoteAudio.srcObject = e.streams[0];
+          document.body.appendChild(remoteAudio);
+        };
+
+        // 5) DataChannel（任意の初期メッセージ送信など）
+        dc = pc.createDataChannel("oai-events");
+        dc.onopen = () => {
+          // 会話の初期指示（必要に応じて変更）
+          dc.send(JSON.stringify({
+            type: "response.create",
+            response: {
+              instructions: "あなたは親切な音声アシスタント。簡潔に日本語で答えてください。"
+            }
+          }));
+        };
+        dc.onmessage = (ev) => {
+          // 必要ならイベントログ
+          // console.log("EVENT", ev.data);
+        };
+
+        // 6) ICEの状態表示（デバッグ）
+        pc.oniceconnectionstatechange = () => {
+          setStatus(`ICE: ${pc.iceConnectionState}`);
+        };
+
+        // 7) SDP交換
+        const offer = await pc.createOffer({ offerToReceiveAudio: true });
+        await pc.setLocalDescription(offer);
+
+        const sdpUrl = "https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+        const resp = await fetch(sdpUrl, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${session.client_secret.value}`,
+            "Content-Type": "application/sdp",
+            "OpenAI-Beta": "realtime=v1"
+          },
+          body: offer.sdp
+        });
+        const answerSdp = await resp.text();
+        await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
+        setRunningState(true);
+      } catch (err) {
+        console.error(err);
+        setStatus("Failed to start: " + err.message);
+        await stopSession(true); // 失敗時もクリーンアップ
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function stopSession(silent = false) {
+      if (cleaning) return;
+      cleaning = true;
+      try {
+        // DataChannel終了
+        try { if (dc && dc.readyState !== "closed") dc.close(); } catch {}
+        dc = null;
+
+        // PeerConnection終了
+        if (pc) {
+          try { pc.getSenders().forEach(s => { try { s.track.stop(); } catch {} }); } catch {}
+          try { pc.close(); } catch {}
+        }
+        pc = null;
+
+        // マイク停止
+        if (micStream) {
+          try { micStream.getTracks().forEach(t => t.stop()); } catch {}
+        }
+        micStream = null;
+
+        // 受信audio 破棄
+        if (remoteAudio) {
+          try { remoteAudio.pause(); } catch {}
+          try { remoteAudio.srcObject = null; } catch {}
+          try { remoteAudio.remove(); } catch {}
+        }
+        remoteAudio = null;
+
+        if (!silent) setStatus("Stopped");
+      } finally {
+        setRunningState(false);
+        cleaning = false;
+      }
+    }
+
+    btn.addEventListener("click", async () => {
+      if (running) {
+        btn.disabled = true;
+        await stopSession();
+        btn.disabled = false;
+      } else {
+        await startSession();
+      }
+    });
+
+    // ページ離脱時も確実に停止
+    window.addEventListener("beforeunload", () => {
+      // 同期的に止めたいので await は使わない
+      if (running) {
+        try { if (dc && dc.readyState !== "closed") dc.close(); } catch {}
+        try { if (pc) pc.close(); } catch {}
+        try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
+      }
+    });
+  </script>
+</body>
+</html>
