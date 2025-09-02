@@ -20,7 +20,9 @@ app.post("/token", async (_req, res) => {
         voice: "alloy",
         modalities: ["audio", "text"],
         // 話し終わりの無音を検出して自動で応答を開始
-        turn_detection: { type: "server_vad", silence_duration_ms: 700 }
+        turn_detection: { type: "server_vad", silence_duration_ms: 700 },
+        // ユーザー音声の自動文字起こしを有効化
+        input_audio_transcription: { model: "gpt-4o-transcribe" }
       })
     });
     if (!r.ok) {

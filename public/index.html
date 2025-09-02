@@ -56,6 +56,12 @@
     <div class="log-wrap">
       <div class="log" id="log"></div>
 
+      <!-- ライブ字幕（ユーザー） -->
+      <div class="msg user" id="live-user" style="padding:12px; display:none; position: sticky; bottom: 48px; margin:0; border-bottom-left-radius:0; border-bottom-right-radius:0; border-color:#bfdbfe; background:#eff6ff;">
+        <div class="role">USER <small>speaking...</small></div>
+        <div class="text" id="live-user-text"></div>
+      </div>
+
       <!-- ライブ字幕（アシスタント） -->
       <div class="msg assistant" id="live-assistant" style="padding:12px; display:none; position: sticky; bottom: 0; margin:0; border-top-left-radius: 0; border-top-right-radius:0; border-color:#d1fae5; background:#ecfdf5;">
         <div class="role">ASSISTANT <small>typing...</small></div>
@@ -79,6 +85,9 @@
     const logEl = document.getElementById("log");
     const liveRow = document.getElementById("live-assistant");
     const liveTextEl = document.getElementById("live-assistant-text");
+    // 追加：ユーザーライブ字幕DOM
+    const liveUserRow = document.getElementById("live-user");
+    const liveUserTextEl = document.getElementById("live-user-text");
 
     // ========= 会話ログ（localStorage連携） =========
     let conversation = []; // { role: "user"|"assistant"|"system"|"event", text, ts }
@@ -125,8 +134,9 @@
     let pc = null, dc = null, micStream = null, remoteAudio = null;
     let running = false, cleaning = false;
 
-    // アシスタントの現在発話（delta を結合）
+    // アシスタント/ユーザーの現在発話（delta を結合）
     let currentAssistantText = "";
+    let currentUserText = "";
 
     function setStatus(t) { statusEl.textContent = t; }
     function setRunningState(on) {
@@ -245,6 +255,27 @@
                 currentAssistantText += deltaText;
               }
 
+              // ========== ユーザー音声の文字起こし（delta） ==========
+              let userDelta = "";
+
+              // 新: conversation.item.input_audio_transcription.delta
+              if (e.type === "conversation.item.input_audio_transcription.delta" && typeof e.delta === "string") {
+                userDelta = e.delta;
+              }
+
+              // 旧互換: input_audio_buffer.transcript.delta
+              if (!userDelta && e.type === "input_audio_buffer.transcript.delta" && typeof e.delta === "string") {
+                userDelta = e.delta;
+              }
+
+              if (userDelta) {
+                currentUserText += userDelta;
+                // ライブ表示（ユーザー）
+                liveUserRow.style.display = "block";
+                liveUserTextEl.textContent = currentUserText;
+                logEl.scrollTop = logEl.scrollHeight;
+              }
+
               // ========== 応答の完了イベントで確定保存 ==========
               const isDone =
                 e.type === "response.completed" ||     // 汎用
@@ -258,14 +289,27 @@
                 if (text) addMessage("assistant", text);
                 currentAssistantText = "";
 
-              // ライブ行は使用しないため明示的に非表示
-              liveTextEl.textContent = "";
-              liveRow.style.display = "none";
+                // ライブ行（アシスタント）は非表示のまま
+                liveTextEl.textContent = "";
+                liveRow.style.display = "none";
               }
 
-              // （ユーザー字幕は現状OFFのまま）
-              // if (e.type === "input_audio_buffer.transcript.delta") { ... }
-              // if (e.type === "input_audio_buffer.transcript.completed") { ... }
+              // ========== ユーザー側の完了で確定保存 ==========
+              const userDone =
+                e.type === "conversation.item.input_audio_transcription.completed" ||
+                e.type === "input_audio_buffer.transcript.completed" ||
+                e.type === "input_audio_buffer.transcript.done";
+
+              if (userDone) {
+                const finalUserText = (e?.transcript?.text || currentUserText || "").trim();
+                if (finalUserText) addMessage("user", finalUserText);
+                currentUserText = "";
+                // ユーザーライブ行リセット
+                liveUserTextEl.textContent = "";
+                liveUserRow.style.display = "none";
+              }
+
+              // （必要なら他イベントもここで拾う）
 
             } catch {
               // 非JSONは無視
@@ -349,6 +393,9 @@
         currentAssistantText = "";
         liveTextEl.textContent = "";
         liveRow.style.display = "none";
+        // 追加：ユーザーライブ行もリセット
+        liveUserTextEl.textContent = "";
+        liveUserRow.style.display = "none";
 
         if (!silent) addMessage("event", "Session stopped");
       } finally {
