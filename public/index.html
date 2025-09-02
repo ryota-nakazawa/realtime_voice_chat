@@ -25,6 +25,25 @@
     .text { white-space: pre-wrap; word-break: break-word; }
     .footer { padding: 10px; display: flex; gap: 8px; justify-content: space-between; align-items: center; }
     .hint { font-size: 12px; color: #6b7280; }
+
+    /* Avatar: 左サイドに大きく常時表示（停止はpause） */
+    .avatar-wrap {
+      position: fixed; left: 16px; top: 50%; transform: translateY(-50%);
+      width: 360px; height: 360px;
+      border-radius: 9999px; overflow: hidden; border: 2px solid #e5e7eb; background: #000; z-index: 20;
+      box-shadow: 0 10px 30px rgba(0,0,0,.25);
+      pointer-events: none; /* UI操作の邪魔をしない */
+    }
+    .avatar-wrap video { width: 100%; height: 100%; object-fit: cover; }
+    .avatar-wrap.speaking { animation: avatarPulse 1.4s infinite; }
+    @keyframes avatarPulse {
+      0% { box-shadow: 0 0 0 0 rgba(99,102,241,.6); }
+      70% { box-shadow: 0 0 0 28px rgba(99,102,241,0); }
+      100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+    }
+    @media (max-width: 1200px) {
+      .avatar-wrap { width: 260px; height: 260px; }
+    }
   </style>
 </head>
 <body>
@@ -75,6 +94,13 @@
     </div>
   </aside>
 
+  <!-- Assistant Avatar: 左に常時表示（停止はpause） -->
+  <div id="avatar" class="avatar-wrap" title="Assistant Avatar" aria-hidden="true">
+    <video id="avatarVideo" preload="auto" playsinline loop muted poster="avatar-poster.jpg">
+      <source src="avatar-talking.mp4" type="video/mp4" />
+    </video>
+  </div>
+
   <script>
     // ========= DOM =========
     const btn = document.getElementById("toggle");
@@ -85,56 +111,113 @@
     const logEl = document.getElementById("log");
     const liveRow = document.getElementById("live-assistant");
     const liveTextEl = document.getElementById("live-assistant-text");
-    // 追加：ユーザーライブ字幕DOM
     const liveUserRow = document.getElementById("live-user");
     const liveUserTextEl = document.getElementById("live-user-text");
+    // アバター
+    const avatarEl = document.getElementById("avatar");
+    const avatarVideoEl = document.getElementById("avatarVideo");
 
     // ========= 会話ログ（localStorage連携） =========
-    let conversation = []; // { role: "user"|"assistant"|"system"|"event", text, ts }
-
+    let conversation = [];
     function nowIso() { return new Date().toISOString(); }
     function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
-    function saveLocal() {
-      try { localStorage.setItem("realtime_conversation", JSON.stringify(conversation)); } catch {}
-    }
-    function loadLocal() {
-      try {
-        const raw = localStorage.getItem("realtime_conversation");
-        if (raw) { conversation = JSON.parse(raw); renderLog(); }
-      } catch {}
-    }
-    function clearLog() {
-      conversation = [];
-      saveLocal();
-      renderLog();
-    }
-    function addMessage(role, text) {
-      if (!text) return;
-      conversation.push({ role, text, ts: nowIso() });
-      renderLog();
-      saveLocal();
-    }
+    function saveLocal() { try { localStorage.setItem("realtime_conversation", JSON.stringify(conversation)); } catch {} }
+    function loadLocal() { try { const raw = localStorage.getItem("realtime_conversation"); if (raw) { conversation = JSON.parse(raw); renderLog(); } } catch {} }
+    function clearLog() { conversation = []; saveLocal(); renderLog(); }
+    function addMessage(role, text) { if (!text) return; conversation.push({ role, text, ts: nowIso() }); renderLog(); saveLocal(); }
     function renderLog() {
       logEl.innerHTML = "";
       for (const m of conversation) {
         const div = document.createElement("div");
         div.className = `msg ${m.role}`;
-        div.innerHTML = `
-          <div class="role">${m.role.toUpperCase()} <small>${m.ts}</small></div>
-          <div class="text">${escapeHtml(m.text)}</div>
-        `;
+        div.innerHTML = `<div class="role">${m.role.toUpperCase()} <small>${m.ts}</small></div><div class="text">${escapeHtml(m.text)}</div>`;
         logEl.appendChild(div);
       }
       logEl.scrollTop = logEl.scrollHeight;
     }
     loadLocal();
 
+    // ========= Avatar Control（VADで制御：音が出ている間は再生） =========
+    let speakStopTimer = null;
+    function startAvatarSpeaking() {
+      if (speakStopTimer) { clearTimeout(speakStopTimer); speakStopTimer = null; }
+      avatarEl.classList.add("speaking");
+      try {
+        if (avatarVideoEl.paused) {
+          avatarVideoEl.currentTime = 0;
+          avatarVideoEl.play();
+        }
+      } catch (e) { console.warn("avatar play blocked:", e?.name || e); }
+    }
+    function stopAvatarSpeaking(immediate = false) {
+      const stop = () => {
+        avatarEl.classList.remove("speaking");
+        try { avatarVideoEl.pause(); } catch {}
+      };
+      if (immediate) return stop();
+      if (speakStopTimer) clearTimeout(speakStopTimer);
+      speakStopTimer = setTimeout(stop, 700); // 余韻
+    }
+
+    // ====== Web Audio VAD（音声エネルギー監視） ======
+    let audioCtx = null, analyser = null, vadSrc = null, vadInterval = null, lastVoiceMs = 0;
+    const VAD = { threshold: 0.018, hangoverMs: 900, intervalMs: 66 }; // 目安: 0.015〜0.03
+
+    function setupAssistantVAD(stream) {
+      try {
+        if (!audioCtx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          audioCtx = new AC();
+        }
+        audioCtx.resume?.();
+
+        if (vadSrc) { try { vadSrc.disconnect(); } catch {} vadSrc = null; }
+        if (!analyser) {
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 2048;
+          analyser.smoothingTimeConstant = 0.08;
+        }
+        vadSrc = audioCtx.createMediaStreamSource(stream);
+        vadSrc.connect(analyser);
+
+        const data = new Uint8Array(analyser.fftSize);
+        lastVoiceMs = performance.now();
+        if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
+
+        vadInterval = setInterval(() => {
+          analyser.getByteTimeDomainData(data);
+          // 平均絶対偏差でレベル推定（0..1）
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {
+            const v = (data[i] - 128) / 128;
+            sum += Math.abs(v);
+          }
+          const level = sum / data.length; // 小さければ無音に近い
+          const now = performance.now();
+
+          if (level > VAD.threshold) {
+            lastVoiceMs = now;
+            startAvatarSpeaking(); // 音が出ている限り再生維持
+          } else if (now - lastVoiceMs > VAD.hangoverMs) {
+            stopAvatarSpeaking(true); // 一定時間無音で停止
+          }
+        }, VAD.intervalMs);
+      } catch (err) {
+        console.warn("VAD setup failed:", err?.message || err);
+      }
+    }
+
+    function teardownVAD() {
+      if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
+      if (vadSrc) { try { vadSrc.disconnect(); } catch {} vadSrc = null; }
+      // analyser / audioCtx は再利用可。閉じたい場合は以下を有効化。
+      // try { audioCtx?.close(); } catch {}
+    }
+
     // ========= 接続制御 =========
     let pc = null, dc = null, micStream = null, remoteAudio = null;
     let running = false, cleaning = false;
 
-    // アシスタント/ユーザーの現在発話（delta を結合）
     let currentAssistantText = "";
     let currentUserText = "";
 
@@ -149,7 +232,7 @@
     async function fetchEphemeralSession() {
       const r = await fetch("/token", { method: "POST" });
       if (!r.ok) throw new Error(await r.text());
-      return r.json(); // { client_secret: { value }, ... }
+      return r.json();
     }
 
     async function startSession() {
@@ -157,8 +240,14 @@
       setStatus("Starting...");
       btn.disabled = true;
       try {
-        // 1) マイク
+        // 1) マイク（ユーザー操作内でAudioContextを起こせる）
         micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // AudioContextは早めに起動（iOS対策）
+        if (!audioCtx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          audioCtx = new AC();
+          await audioCtx.resume();
+        }
 
         // 2) Ephemeral token
         const session = await fetchEphemeralSession();
@@ -169,24 +258,25 @@
 
         // 4) 受信音声
         pc.ontrack = (e) => {
-          if (remoteAudio) {
-            try { remoteAudio.pause(); } catch {}
-            remoteAudio.remove();
-          }
+          if (remoteAudio) { try { remoteAudio.pause(); } catch {}; try { remoteAudio.remove(); } catch {} }
           remoteAudio = document.createElement("audio");
           remoteAudio.autoplay = true;
           remoteAudio.srcObject = e.streams[0];
+          // 受信オーディオイベント（補強）
+          remoteAudio.addEventListener("play", () => startAvatarSpeaking());
+          remoteAudio.addEventListener("pause", () => stopAvatarSpeaking(true));
+          remoteAudio.addEventListener("ended", () => stopAvatarSpeaking(true));
           document.body.appendChild(remoteAudio);
+
+          // ★ Assistant音声のVADを開始
+          setupAssistantVAD(e.streams[0]);
         };
 
-        // 5) DataChannel（ログ・字幕処理の要）
-        //    - クライアント側で作成
-        //    - 万一サーバ側が作成した場合にも拾えるよう ondatachannel も設定
+        // 5) DataChannel
         const attachDataChannel = (channel) => {
           dc = channel;
           dc.onopen = () => {
             addMessage("event", "Session started");
-            // 初期システム指示
             dc.send(JSON.stringify({
               type: "response.create",
               response: {
@@ -194,7 +284,6 @@
                 modalities: ["text", "audio"]
               }
             }));
-            // 初回起動用の短いテキスト入力で応答を確実に発火
             dc.send(JSON.stringify({
               type: "response.create",
               response: {
@@ -204,97 +293,68 @@
             }));
           };
 
-          // ---- デバッグ: 最初の数件だけ生イベントを観察 ----
           let debugCount = 0;
           const DEBUG_LIMIT = 10;
 
-          // ---- ここで複数パターンのイベント名を吸収して字幕に反映 ----
           dc.onmessage = (ev) => {
             try {
               const e = JSON.parse(ev.data);
+              if (debugCount < DEBUG_LIMIT) { console.log("[Realtime event]", e); debugCount++; }
 
-              // デバッグ出力（最初のN件のみ）
-              if (debugCount < DEBUG_LIMIT) {
-                console.log("[Realtime event]", e);
-                debugCount++;
-                if (debugCount === DEBUG_LIMIT) {
-                  console.log(`(debug) reached first ${DEBUG_LIMIT} events, debug logging stopped.`);
-                }
-              }
-
-              // ========== アシスタントのストリーミング字幕（delta） ==========
+              // ===== アシスタントのテキスト増分（開始トリガのみ利用）=====
               let deltaText = "";
+              if (e.type === "response.delta" && typeof e.delta === "string") deltaText = e.delta;
+              if (e.type === "response.text.delta" && typeof e.delta === "string") deltaText = e.delta;
+              if (e.type === "response.output_text.delta" && typeof e.delta === "string") deltaText = e.delta;
+              if (e.type === "response.audio_transcript.delta" && typeof e.delta === "string") deltaText = e.delta;
+              if (!deltaText && e?.delta?.text) deltaText = e.delta.text;
 
-              // 1) 旧: response.delta（string直）
-              if (e.type === "response.delta" && typeof e.delta === "string") {
-                deltaText = e.delta;
-              }
-
-              // 2) よくある: response.text.delta
-              if (e.type === "response.text.delta" && typeof e.delta === "string") {
-                deltaText = e.delta;
-              }
-
-              // 3) 新系: response.output_text.delta
-              if (e.type === "response.output_text.delta" && typeof e.delta === "string") {
-                deltaText = e.delta;
-              }
-
-              // 3.5) 音声の文字起こし: response.audio_transcript.delta
-              if (e.type === "response.audio_transcript.delta" && typeof e.delta === "string") {
-                deltaText = e.delta;
-              }
-
-              // 4) 互換: e.delta?.text などに備える（念のため）
-              if (!deltaText && e && typeof e === "object" && e.delta && typeof e.delta.text === "string") {
-                deltaText = e.delta.text;
-              }
-
-              // リアルタイムの字幕は出さず、完了時にまとめて表示
               if (deltaText) {
                 currentAssistantText += deltaText;
+                // 開始は積極的に（VADと二重でもOK）
+                startAvatarSpeaking();
               }
 
-              // ========== ユーザー音声の文字起こし（delta） ==========
+              // ===== ユーザー音声の文字起こし（delta）=====
               let userDelta = "";
-
-              // 新: conversation.item.input_audio_transcription.delta
-              if (e.type === "conversation.item.input_audio_transcription.delta" && typeof e.delta === "string") {
-                userDelta = e.delta;
-              }
-
-              // 旧互換: input_audio_buffer.transcript.delta
-              if (!userDelta && e.type === "input_audio_buffer.transcript.delta" && typeof e.delta === "string") {
-                userDelta = e.delta;
-              }
+              if (e.type === "conversation.item.input_audio_transcription.delta" && typeof e.delta === "string") userDelta = e.delta;
+              if (!userDelta && e.type === "input_audio_buffer.transcript.delta" && typeof e.delta === "string") userDelta = e.delta;
 
               if (userDelta) {
                 currentUserText += userDelta;
-                // ライブ表示（ユーザー）
                 liveUserRow.style.display = "block";
                 liveUserTextEl.textContent = currentUserText;
                 logEl.scrollTop = logEl.scrollHeight;
               }
 
-              // ========== 応答の完了イベントで確定保存 ==========
+              // ===== 応答完了 =====
               const isDone =
-                e.type === "response.completed" ||     // 汎用
-                e.type === "response.text.done" ||     // text系
-                e.type === "response.output_text.done" || // 新text系
-                e.type === "response.audio_transcript.done" // 音声文字起こしの完了
-              ;
+                e.type === "response.completed" ||
+                e.type === "response.text.done" ||
+                e.type === "response.output_text.done" ||
+                e.type === "response.audio_transcript.done";
 
               if (isDone) {
                 const text = currentAssistantText.trim();
                 if (text) addMessage("assistant", text);
                 currentAssistantText = "";
-
-                // ライブ行（アシスタント）は非表示のまま
                 liveTextEl.textContent = "";
                 liveRow.style.display = "none";
+                // ★ ここで stop はしない → VAD（実際の無音）で止める
+                // stopAvatarSpeaking();  // ← 無効化
               }
 
-              // ========== ユーザー側の完了で確定保存 ==========
+              // 公式：response.done も同様
+              if (e.type === "response.done") {
+                const text = currentAssistantText.trim();
+                if (text) addMessage("assistant", text);
+                currentAssistantText = "";
+                liveTextEl.textContent = "";
+                liveRow.style.display = "none";
+                // stopAvatarSpeaking(); // ← 無効化
+              }
+
+              // ===== ユーザー側の完了 =====
               const userDone =
                 e.type === "conversation.item.input_audio_transcription.completed" ||
                 e.type === "input_audio_buffer.transcript.completed" ||
@@ -304,33 +364,19 @@
                 const finalUserText = (e?.transcript?.text || currentUserText || "").trim();
                 if (finalUserText) addMessage("user", finalUserText);
                 currentUserText = "";
-                // ユーザーライブ行リセット
                 liveUserTextEl.textContent = "";
                 liveUserRow.style.display = "none";
               }
-
-              // （必要なら他イベントもここで拾う）
-
-            } catch {
-              // 非JSONは無視
-            }
+            } catch { /* 非JSONは無視 */ }
           };
         };
 
-        // クライアント側でデータチャネルを作成
         attachDataChannel(pc.createDataChannel("oai-events"));
-        // サーバ側で作られた場合にも拾う
-        pc.ondatachannel = (ev) => {
-          if (!dc || dc.readyState === "closed") attachDataChannel(ev.channel);
-        };
+        pc.ondatachannel = (ev) => { if (!dc || dc.readyState === "closed") attachDataChannel(ev.channel); };
 
         pc.oniceconnectionstatechange = () => {
           const s = pc.iceConnectionState;
           iceEl.textContent = `ICE: ${s}`;
-          if (s === "failed" || s === "disconnected") {
-            // 状態が悪化したら停止（必要に応じて自動リトライも可）
-            // stopSession(true);
-          }
         };
 
         // 6) SDP交換
@@ -354,7 +400,7 @@
       } catch (err) {
         console.error(err);
         setStatus("Failed to start: " + (err?.message || err));
-        await stopSession(true); // 失敗時クリーンアップ
+        await stopSession(true);
       } finally {
         btn.disabled = false;
       }
@@ -364,24 +410,20 @@
       if (cleaning) return;
       cleaning = true;
       try {
-        // DataChannel
         try { if (dc && dc.readyState !== "closed") dc.close(); } catch {}
         dc = null;
 
-        // PC
         if (pc) {
           try { pc.getSenders().forEach(s => { try { s.track.stop(); } catch {} }); } catch {}
           try { pc.close(); } catch {}
         }
         pc = null;
 
-        // mic
         if (micStream) {
           try { micStream.getTracks().forEach(t => t.stop()); } catch {}
         }
         micStream = null;
 
-        // audio
         if (remoteAudio) {
           try { remoteAudio.pause(); } catch {}
           try { remoteAudio.srcObject = null; } catch {}
@@ -393,9 +435,12 @@
         currentAssistantText = "";
         liveTextEl.textContent = "";
         liveRow.style.display = "none";
-        // 追加：ユーザーライブ行もリセット
         liveUserTextEl.textContent = "";
         liveUserRow.style.display = "none";
+
+        // VAD停止 & アバター停止
+        teardownVAD();
+        stopAvatarSpeaking(true);
 
         if (!silent) addMessage("event", "Session stopped");
       } finally {
@@ -404,16 +449,12 @@
       }
     }
 
-    // ========= イベント =========
+    // ========= UIイベント =========
     btn.addEventListener("click", async () => {
       if (running) { btn.disabled = true; await stopSession(); btn.disabled = false; }
       else { await startSession(); }
     });
-
-    btnClear.addEventListener("click", () => {
-      if (confirm("ログを消去しますか？")) clearLog();
-    });
-
+    btnClear.addEventListener("click", () => { if (confirm("ログを消去しますか？")) clearLog(); });
     btnExport.addEventListener("click", () => {
       const blob = new Blob([JSON.stringify({ conversation }, null, 2)], { type: "application/json" });
       const a = document.createElement("a");
@@ -423,13 +464,9 @@
       a.click();
       URL.revokeObjectURL(a.href);
     });
-
     window.addEventListener("beforeunload", () => {
-      if (running) {
-        try { if (dc && dc.readyState !== "closed") dc.close(); } catch {}
-        try { if (pc) pc.close(); } catch {}
-        try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch {}
-      }
+      try { stopAvatarSpeaking(true); } catch {}
+      try { teardownVAD(); } catch {}
     });
   </script>
 </body>
