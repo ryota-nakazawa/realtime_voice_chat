@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>OpenAI Realtime (WebRTC) - Toggle & Transcript & Save</title>
+  <title>OpenAI Realtime (WebRTC) - Toggle & Transcript & Save + Tools</title>
   <style>
     :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
     * { box-sizing: border-box; }
@@ -25,25 +25,11 @@
     .text { white-space: pre-wrap; word-break: break-word; }
     .footer { padding: 10px; display: flex; gap: 8px; justify-content: space-between; align-items: center; }
     .hint { font-size: 12px; color: #6b7280; }
-
-    /* Avatar: 左サイドに大きく常時表示（停止はpause） */
-    .avatar-wrap {
-      position: fixed; left: 16px; top: 50%; transform: translateY(-50%);
-      width: 360px; height: 360px;
-      border-radius: 9999px; overflow: hidden; border: 2px solid #e5e7eb; background: #000; z-index: 20;
-      box-shadow: 0 10px 30px rgba(0,0,0,.25);
-      pointer-events: none; /* UI操作の邪魔をしない */
-    }
+    .avatar-wrap { position: fixed; left: 16px; top: 50%; transform: translateY(-50%); width: 360px; height: 360px; border-radius: 9999px; overflow: hidden; border: 2px solid #e5e7eb; background: #000; z-index: 20; box-shadow: 0 10px 30px rgba(0,0,0,.25); pointer-events: none; }
     .avatar-wrap video { width: 100%; height: 100%; object-fit: cover; }
     .avatar-wrap.speaking { animation: avatarPulse 1.4s infinite; }
-    @keyframes avatarPulse {
-      0% { box-shadow: 0 0 0 0 rgba(99,102,241,.6); }
-      70% { box-shadow: 0 0 0 28px rgba(99,102,241,0); }
-      100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
-    }
-    @media (max-width: 1200px) {
-      .avatar-wrap { width: 260px; height: 260px; }
-    }
+    @keyframes avatarPulse { 0% { box-shadow: 0 0 0 0 rgba(99,102,241,.6); } 70% { box-shadow: 0 0 0 28px rgba(99,102,241,0); } 100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); } }
+    @media (max-width: 1200px) { .avatar-wrap { width: 260px; height: 260px; } }
   </style>
 </head>
 <body>
@@ -57,44 +43,38 @@
   </header>
 
   <main>
-    <h2>Realtime Voice Demo</h2>
+    <h2>Realtime Voice + Function Calling Demo</h2>
     <p>
       「▶ Start」で会話開始／「■ Stop」で停止。<br/>
-      右側にアシスタントの返答が <b>字幕としてリアルタイム表示</b> され、確定後はログに保存されます。
+      右側にアシスタントの返答が <b>字幕としてリアルタイム表示</b> され、確定後はログに保存されます。<br/>
+      <b>試すなら：</b>「東京の天気を教えて」「大阪は華氏で」など。
     </p>
     <ul>
-      <li>ログは <code>localStorage</code> に自動保存（リロードしても残ります）</li>
+      <li>ログは <code>localStorage</code> に自動保存</li>
       <li>「Export JSON」で会話履歴を書き出し</li>
-      <li>ユーザー字幕は現時点ではオフ（後から追加可能）</li>
+      <li>function calling: <code>get_weather</code> を実装済み</li>
     </ul>
   </main>
 
   <aside>
     <div class="panel-title">Transcript / Logs</div>
-
     <div class="log-wrap">
       <div class="log" id="log"></div>
-
-      <!-- ライブ字幕（ユーザー） -->
       <div class="msg user" id="live-user" style="padding:12px; display:none; position: sticky; bottom: 48px; margin:0; border-bottom-left-radius:0; border-bottom-right-radius:0; border-color:#bfdbfe; background:#eff6ff;">
         <div class="role">USER <small>speaking...</small></div>
         <div class="text" id="live-user-text"></div>
       </div>
-
-      <!-- ライブ字幕（アシスタント） -->
       <div class="msg assistant" id="live-assistant" style="padding:12px; display:none; position: sticky; bottom: 0; margin:0; border-top-left-radius: 0; border-top-right-radius:0; border-color:#d1fae5; background:#ecfdf5;">
         <div class="role">ASSISTANT <small>typing...</small></div>
         <div class="text" id="live-assistant-text"></div>
       </div>
     </div>
-
     <div class="footer">
       <small class="hint">Autosave: localStorage</small>
       <small id="ice" class="hint"></small>
     </div>
   </aside>
 
-  <!-- Assistant Avatar: 左に常時表示（停止はpause） -->
   <div id="avatar" class="avatar-wrap" title="Assistant Avatar" aria-hidden="true">
     <video id="avatarVideo" preload="auto" playsinline loop muted poster="avatar-poster.jpg">
       <source src="avatar-talking.mp4" type="video/mp4" />
@@ -113,11 +93,10 @@
     const liveTextEl = document.getElementById("live-assistant-text");
     const liveUserRow = document.getElementById("live-user");
     const liveUserTextEl = document.getElementById("live-user-text");
-    // アバター
     const avatarEl = document.getElementById("avatar");
     const avatarVideoEl = document.getElementById("avatarVideo");
 
-    // ========= 会話ログ（localStorage連携） =========
+    // ========= Conversation log =========
     let conversation = [];
     function nowIso() { return new Date().toISOString(); }
     function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -137,31 +116,22 @@
     }
     loadLocal();
 
-    // ========= Avatar Control（VADで制御：音が出ている間は再生） =========
+    // ========= Avatar (VAD) =========
     let speakStopTimer = null;
     function startAvatarSpeaking() {
       if (speakStopTimer) { clearTimeout(speakStopTimer); speakStopTimer = null; }
       avatarEl.classList.add("speaking");
-      try {
-        if (avatarVideoEl.paused) {
-          avatarVideoEl.currentTime = 0;
-          avatarVideoEl.play();
-        }
-      } catch (e) { console.warn("avatar play blocked:", e?.name || e); }
+      try { if (avatarVideoEl.paused) { avatarVideoEl.currentTime = 0; avatarVideoEl.play(); } } catch (e) { console.warn("avatar play blocked:", e?.name || e); }
     }
     function stopAvatarSpeaking(immediate = false) {
-      const stop = () => {
-        avatarEl.classList.remove("speaking");
-        try { avatarVideoEl.pause(); } catch {}
-      };
+      const stop = () => { avatarEl.classList.remove("speaking"); try { avatarVideoEl.pause(); } catch {} };
       if (immediate) return stop();
       if (speakStopTimer) clearTimeout(speakStopTimer);
-      speakStopTimer = setTimeout(stop, 700); // 余韻
+      speakStopTimer = setTimeout(stop, 700);
     }
 
-    // ====== Web Audio VAD（音声エネルギー監視） ======
     let audioCtx = null, analyser = null, vadSrc = null, vadInterval = null, lastVoiceMs = 0;
-    const VAD = { threshold: 0.018, hangoverMs: 900, intervalMs: 66 }; // 目安: 0.015〜0.03
+    const VAD = { threshold: 0.018, hangoverMs: 900, intervalMs: 66 };
 
     function setupAssistantVAD(stream) {
       try {
@@ -186,20 +156,19 @@
 
         vadInterval = setInterval(() => {
           analyser.getByteTimeDomainData(data);
-          // 平均絶対偏差でレベル推定（0..1）
           let sum = 0;
           for (let i = 0; i < data.length; i++) {
             const v = (data[i] - 128) / 128;
             sum += Math.abs(v);
           }
-          const level = sum / data.length; // 小さければ無音に近い
+          const level = sum / data.length;
           const now = performance.now();
 
           if (level > VAD.threshold) {
             lastVoiceMs = now;
-            startAvatarSpeaking(); // 音が出ている限り再生維持
+            startAvatarSpeaking();
           } else if (now - lastVoiceMs > VAD.hangoverMs) {
-            stopAvatarSpeaking(true); // 一定時間無音で停止
+            stopAvatarSpeaking(true);
           }
         }, VAD.intervalMs);
       } catch (err) {
@@ -210,11 +179,9 @@
     function teardownVAD() {
       if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
       if (vadSrc) { try { vadSrc.disconnect(); } catch {} vadSrc = null; }
-      // analyser / audioCtx は再利用可。閉じたい場合は以下を有効化。
-      // try { audioCtx?.close(); } catch {}
     }
 
-    // ========= 接続制御 =========
+    // ========= WebRTC session =========
     let pc = null, dc = null, micStream = null, remoteAudio = null;
     let running = false, cleaning = false;
 
@@ -235,60 +202,50 @@
       return r.json();
     }
 
+    // --- Function Calling state ---
+    const toolCalls = new Map(); // call_id -> { name, argsText }
+
     async function startSession() {
       if (running) return;
       setStatus("Starting...");
       btn.disabled = true;
       try {
-        // 1) マイク（ユーザー操作内でAudioContextを起こせる）
         micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        // AudioContextは早めに起動（iOS対策）
         if (!audioCtx) {
           const AC = window.AudioContext || window.webkitAudioContext;
           audioCtx = new AC();
           await audioCtx.resume();
         }
 
-        // 2) Ephemeral token
         const session = await fetchEphemeralSession();
-
-        // 3) PeerConnection
-        pc = new RTCPeerConnection();
+        pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        });
         micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
 
-        // 4) 受信音声
         pc.ontrack = (e) => {
           if (remoteAudio) { try { remoteAudio.pause(); } catch {}; try { remoteAudio.remove(); } catch {} }
           remoteAudio = document.createElement("audio");
           remoteAudio.autoplay = true;
           remoteAudio.srcObject = e.streams[0];
-          // 受信オーディオイベント（補強）
           remoteAudio.addEventListener("play", () => startAvatarSpeaking());
           remoteAudio.addEventListener("pause", () => stopAvatarSpeaking(true));
           remoteAudio.addEventListener("ended", () => stopAvatarSpeaking(true));
           document.body.appendChild(remoteAudio);
-
-          // ★ Assistant音声のVADを開始
           setupAssistantVAD(e.streams[0]);
         };
 
-        // 5) DataChannel
         const attachDataChannel = (channel) => {
           dc = channel;
           dc.onopen = () => {
             addMessage("event", "Session started");
+            // 初期メッセージ（テスト兼ねる）。日本語・ツール使用の方針を明示。
             dc.send(JSON.stringify({
               type: "response.create",
               response: {
-                instructions: "あなたは親切な音声アシスタント。簡潔な日本語で要点を返答してください。",
-                modalities: ["text", "audio"]
-              }
-            }));
-            dc.send(JSON.stringify({
-              type: "response.create",
-              response: {
-                input_text: "テストです。短く自己紹介してみてください。",
-                modalities: ["text", "audio"]
+                instructions: "原則日本語で簡潔に回答。一般知識・技術解説・定義・事実確認などの『知識質問』に答える前に必ず search_kb を1回呼び、上位ヒットを根拠に回答し、少なくとも1件の出典（タイトルとURL）を短く明示。天気は get_weather を使用。ヒット0件ならその旨と絞り込み提案。推測やハルシネーションは避ける。",
+                modalities: ["text", "audio"],
+                input_text: "テストです。まずは短く自己紹介し、続いて『東京の天気』の例と、『Function Calling や RAG とは？』の例を示してください。"
               }
             }));
           };
@@ -301,7 +258,7 @@
               const e = JSON.parse(ev.data);
               if (debugCount < DEBUG_LIMIT) { console.log("[Realtime event]", e); debugCount++; }
 
-              // ===== アシスタントのテキスト増分（開始トリガのみ利用）=====
+              // ===== Assistant text delta =====
               let deltaText = "";
               if (e.type === "response.delta" && typeof e.delta === "string") deltaText = e.delta;
               if (e.type === "response.text.delta" && typeof e.delta === "string") deltaText = e.delta;
@@ -311,15 +268,17 @@
 
               if (deltaText) {
                 currentAssistantText += deltaText;
-                // 開始は積極的に（VADと二重でもOK）
                 startAvatarSpeaking();
+                // ★ ライブ字幕の表示・更新（修正点）
+                liveRow.style.display = "block";
+                liveTextEl.textContent = currentAssistantText;
+                logEl.scrollTop = logEl.scrollHeight;
               }
 
-              // ===== ユーザー音声の文字起こし（delta）=====
+              // ===== User transcript delta =====
               let userDelta = "";
               if (e.type === "conversation.item.input_audio_transcription.delta" && typeof e.delta === "string") userDelta = e.delta;
               if (!userDelta && e.type === "input_audio_buffer.transcript.delta" && typeof e.delta === "string") userDelta = e.delta;
-
               if (userDelta) {
                 currentUserText += userDelta;
                 liveUserRow.style.display = "block";
@@ -327,7 +286,29 @@
                 logEl.scrollTop = logEl.scrollHeight;
               }
 
-              // ===== 応答完了 =====
+              // ===== Function Calling: arguments delta =====
+              if (e.type === "response.function_call_arguments.delta") {
+                const { call_id, delta, name } = e;
+                const rec = toolCalls.get(call_id) || { name: name || "", argsText: "" };
+                if (name && !rec.name) rec.name = name;
+                rec.argsText += (delta || "");
+                toolCalls.set(call_id, rec);
+              }
+
+              // ===== Function Calling: arguments done -> execute tool =====
+              if (e.type === "response.function_call_arguments.done") {
+                const { call_id, arguments: finalArgs, name } = e;
+                const rec = toolCalls.get(call_id) || { name: name || "", argsText: finalArgs || "" };
+                if (name && !rec.name) rec.name = name;
+
+                let argsObj = {};
+                try { argsObj = JSON.parse(rec.argsText || finalArgs || "{}"); } catch {}
+                addMessage("event", `tool_call: ${rec.name || "unknown"} ${rec.argsText || ""}`);
+
+                handleToolCall(rec.name, call_id, argsObj);
+              }
+
+              // ===== Assistant done =====
               const isDone =
                 e.type === "response.completed" ||
                 e.type === "response.text.done" ||
@@ -335,26 +316,22 @@
                 e.type === "response.audio_transcript.done";
 
               if (isDone) {
-                const text = currentAssistantText.trim();
+                const text = (liveTextEl.textContent || currentAssistantText).trim();
                 if (text) addMessage("assistant", text);
                 currentAssistantText = "";
                 liveTextEl.textContent = "";
                 liveRow.style.display = "none";
-                // ★ ここで stop はしない → VAD（実際の無音）で止める
-                // stopAvatarSpeaking();  // ← 無効化
               }
 
-              // 公式：response.done も同様
               if (e.type === "response.done") {
-                const text = currentAssistantText.trim();
+                const text = (liveTextEl.textContent || currentAssistantText).trim();
                 if (text) addMessage("assistant", text);
                 currentAssistantText = "";
                 liveTextEl.textContent = "";
                 liveRow.style.display = "none";
-                // stopAvatarSpeaking(); // ← 無効化
               }
 
-              // ===== ユーザー側の完了 =====
+              // ===== User transcript done =====
               const userDone =
                 e.type === "conversation.item.input_audio_transcription.completed" ||
                 e.type === "input_audio_buffer.transcript.completed" ||
@@ -373,17 +350,14 @@
 
         attachDataChannel(pc.createDataChannel("oai-events"));
         pc.ondatachannel = (ev) => { if (!dc || dc.readyState === "closed") attachDataChannel(ev.channel); };
+        pc.oniceconnectionstatechange = () => { iceEl.textContent = `ICE: ${pc.iceConnectionState}`; };
 
-        pc.oniceconnectionstatechange = () => {
-          const s = pc.iceConnectionState;
-          iceEl.textContent = `ICE: ${s}`;
-        };
-
-        // 6) SDP交換
-        const offer = await pc.createOffer({ offerToReceiveAudio: true });
+        // SDP exchange
+        const REALTIME_MODEL = new URLSearchParams(location.search).get("model") || "gpt-realtime";
+        const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        const sdpUrl = "https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+        const sdpUrl = `https://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`;
         const resp = await fetch(sdpUrl, {
           method: "POST",
           headers: {
@@ -393,6 +367,10 @@
           },
           body: offer.sdp
         });
+        if (!resp.ok) {
+          const t = await resp.text().catch(() => "");
+          throw new Error(`Realtime answer error: ${resp.status} ${t}`);
+        }
         const answerSdp = await resp.text();
         await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
 
@@ -419,9 +397,7 @@
         }
         pc = null;
 
-        if (micStream) {
-          try { micStream.getTracks().forEach(t => t.stop()); } catch {}
-        }
+        if (micStream) { try { micStream.getTracks().forEach(t => t.stop()); } catch {} }
         micStream = null;
 
         if (remoteAudio) {
@@ -431,14 +407,13 @@
         }
         remoteAudio = null;
 
-        // ライブ行リセット
         currentAssistantText = "";
         liveTextEl.textContent = "";
         liveRow.style.display = "none";
+        currentUserText = "";
         liveUserTextEl.textContent = "";
         liveUserRow.style.display = "none";
 
-        // VAD停止 & アバター停止
         teardownVAD();
         stopAvatarSpeaking(true);
 
@@ -449,7 +424,69 @@
       }
     }
 
-    // ========= UIイベント =========
+    // ========= Tool implementations =========
+    async function handleToolCall(name, callId, args) {
+      try {
+        let output = {};
+        switch (name) {
+          case "get_weather": {
+            const { city = "東京", unit = "c" } = args || {};
+            // 実運用ではバックエンドAPIや外部天気APIを呼ぶ
+            // ここではダミー値（摂氏25℃ / 晴れ）
+            output = {
+              city,
+              temperature: unit === "f" ? 77 : 25,
+              condition: "晴れ",
+              unit
+            };
+            break;
+          }
+          case "search_kb": {
+            const { query = "", top_k = 5 } = args || {};
+            const r = await fetch("/rag/search", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ query, top_k })
+            });
+            if (!r.ok) {
+              const t = await r.text().catch(() => "");
+              output = { error: `search_kb failed: ${r.status} ${t.slice(0,200)}` };
+            } else {
+              const data = await r.json();
+              output = { results: data.results || [], query: data.query, top_k: data.top_k };
+            }
+            break;
+          }
+          default:
+            output = { error: `Unknown tool: ${name}` };
+        }
+
+        // 1) function_call_output を会話に注入（call_id を必ず一致）
+        dc?.send(JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "function_call_output",
+            call_id: callId,
+            output: JSON.stringify(output)
+          }
+        }));
+
+        addMessage("event", `tool_output: ${name} -> ${JSON.stringify(output)}`);
+
+        // 2) 結果を踏まえて応答を生成
+        dc?.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            instructions: "直前の関数結果に基づき、日本語で簡潔に回答。search_kb の結果が含まれる場合は最低1件の出典（タイトルとURL）を短く明示。ヒット0件のときはその旨と追加の質問/絞り込み提案を行う。推測やハルシネーションは避ける。",
+            modalities: ["text", "audio"]
+          }
+        }));
+      } catch (err) {
+        console.error("tool error:", err);
+      }
+    }
+
+    // ========= UI =========
     btn.addEventListener("click", async () => {
       if (running) { btn.disabled = true; await stopSession(); btn.disabled = false; }
       else { await startSession(); }

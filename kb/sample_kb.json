@@ -1,0 +1,37 @@
+[
+  {
+    "id": "kb-001",
+    "title": "OpenAI Realtime 概要",
+    "url": "https://example.local/realtime/overview",
+    "tags": ["realtime", "webrtc", "voice"],
+    "content": "OpenAI Realtime API は音声やテキストを低レイテンシでやり取りするための双方向ストリーミング API です。WebRTC を利用し、音声ストリームとデータチャネル経由のイベントを用いて対話を行います。"
+  },
+  {
+    "id": "kb-002",
+    "title": "Function Calling パターン",
+    "url": "https://example.local/ai/function-calling",
+    "tags": ["function-calling", "tools", "ai"],
+    "content": "Function Calling は、モデルが外部ツールを呼び出して情報取得や実行を行う仕組みです。ツールのスキーマ（名前、引数）を宣言し、引数デルタを受け取り、結果を function_call_output として会話に注入します。"
+  },
+  {
+    "id": "kb-003",
+    "title": "RAG（Retrieval-Augmented Generation）の基本",
+    "url": "https://example.local/rag/basics",
+    "tags": ["rag", "retrieval", "search"],
+    "content": "RAG は検索（Retrieval）で外部知識を取得し、生成（Generation）に活用する手法です。クエリに対してベクタ検索や全文検索で関連文書を収集し、要約や引用を用いて回答の正確性を高めます。"
+  },
+  {
+    "id": "kb-004",
+    "title": "日本の主要都市の気候メモ",
+    "url": "https://example.local/weather/japan-cities",
+    "tags": ["weather", "japan", "cities"],
+    "content": "東京は温暖湿潤気候で、夏は高温多湿、冬は比較的温暖です。大阪や名古屋も似た傾向ですが、地域により降水パターンや季節風の影響が異なります。"
+  },
+  {
+    "id": "kb-005",
+    "title": "WebRTC の基本用語",
+    "url": "https://example.local/webrtc/terms",
+    "tags": ["webrtc", "sdp", "ice"],
+    "content": "WebRTC では SDP（Session Description Protocol）を用いたオファー/アンサー、ICE 候補収集、STUN/TURN サーバによる NAT 超えなどの概念が重要です。"
+  }
+]
