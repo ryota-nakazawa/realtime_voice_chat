@@ -105,10 +105,25 @@ app.post("/token", async (_req, res) => {
             },
             required: ["query"]
           }
+        },
+        {
+          type: "function",
+          name: "analyze_emotion",
+          description: "音声特徴(f0_mean/rms_mean/speech_rate)とテキストから感情(主感情/バレンス/覚醒度)を推定",
+          parameters: {
+            type: "object",
+            properties: {
+              f0_mean: { type: "number", description: "基本周波数の平均(Hz、推定)" },
+              rms_mean: { type: "number", description: "音量RMSの平均(0-1程度)" },
+              speech_rate: { type: "number", description: "発話速度(文字/秒など)" },
+              transcript: { type: "string", description: "該当区間の文字起こしテキスト" }
+            }
+            // すべて任意: クライアントが未指定なら可能な範囲で補完
+          }
         }
       ],
-      // セッション全体の方針: 知識質問は必ず search_kb を使用
-      instructions: "あなたは親切な音声アシスタントです。原則日本語で簡潔に回答します。一般知識・技術解説・定義・事実確認などの『知識質問』に回答する前に必ず一度 search_kb 関数を呼び出し、上位ヒットの要点を統合して回答してください。最低1件の出典（タイトルとURL）を短く明示します。天気の質問は get_weather を使用します。ヒットが0件のときはその旨を伝え、質問の絞り込みを促してください。推測やハルシネーションは避けてください。"
+      // セッション全体の方針: 知識質問は search_kb、毎発話で感情推定
+      instructions: "あなたは親切な音声アシスタントです。原則日本語で簡潔に回答します。一般知識・技術解説・定義・事実確認などの『知識質問』に回答する前に必ず一度 search_kb 関数を呼び出し、上位ヒットの要点を統合して回答してください。最低1件の出典（タイトルとURL）を短く明示します。さらに、ユーザの各発話が文字起こしで確定するたびに、必ず1回 analyze_emotion を呼び出し、直近の音声特徴とテキストから感情(推定)をまとめ、その結果に基づいて語調を調整して返答してください。ヒットが0件のときはその旨を伝え、質問の絞り込みを促してください。推測やハルシネーションは避けてください。"
     };
 
     const r = await fetch("https://api.openai.com/v1/realtime/sessions", {
@@ -257,6 +272,76 @@ app.post("/rag/stats/reset", (_req, res) => {
   RAG_STATS.total = 0;
   RAG_STATS.recent = [];
   res.json({ ok: true });
+});
+
+// --- Emotion analysis endpoint (heuristic, lightweight) ---
+function clamp01(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+function safeNum(x, d = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+}
+
+app.post("/emotion/analyze", (req, res) => {
+  try {
+    const {
+      f0_mean: f0In,
+      rms_mean: rmsIn,
+      speech_rate: rateIn,
+      transcript = ""
+    } = req.body || {};
+
+    const f0 = safeNum(f0In, 0);
+    const rms = safeNum(rmsIn, 0);
+    const rate = safeNum(rateIn, 0);
+
+    // Rough normalization baselines
+    const f0_norm = clamp01((f0 - 120) / 120);        // ~120Hz baseline, 120Hz span
+    const rms_norm = clamp01(rms / 0.2);               // 0.2 ≈ moderately loud in RMS(0..~0.5)
+    const rate_norm = clamp01(rate / 8);               // 8 chars/sec ≈ fast
+
+    // Arousal: 0..1 (energy/pitch/speed)
+    const arousal = clamp01(0.5 * rms_norm + 0.3 * f0_norm + 0.2 * rate_norm);
+
+    // Very small JP sentiment lexicon (toy)
+    const pos = [
+      "嬉しい","楽しい","良い","最高","素晴らしい","感謝","ありがとう","助かる","好き","安心","嬉しかった","やった","助かった"
+    ];
+    const neg = [
+      "悲しい","辛い","最悪","嫌い","怒る","腹立つ","不安","心配","疲れた","しんどい","困る","やばい","怖い","怒り","苛立ち","イライラ","落ち込む","不快"
+    ];
+    const t = String(transcript || "");
+    const posCount = pos.reduce((n, w) => n + (t.includes(w) ? 1 : 0), 0);
+    const negCount = neg.reduce((n, w) => n + (t.includes(w) ? 1 : 0), 0);
+    const valLex = (posCount - negCount) / (posCount + negCount + 1); // -1..1 approx
+    // Mix lexical valence with arousal-weighted neutrality bias
+    const valence = Math.max(-1, Math.min(1, valLex));
+    const polarity = valence > 0.15 ? "pos" : (valence < -0.15 ? "neg" : "neu");
+
+    let primary = "calm/neutral";
+    if (arousal >= 0.6 && valence >= 0.2) primary = "happy/excited";
+    else if (arousal >= 0.6 && valence <= -0.2) primary = "angry/frustrated";
+    else if (arousal <= 0.4 && valence <= -0.2) primary = "sad/tired";
+
+    const present = [Number.isFinite(f0In), Number.isFinite(rmsIn), Number.isFinite(rateIn)].filter(Boolean).length;
+    const infoStrength = clamp01(0.4 * arousal + 0.3 * Math.abs(valence) + 0.3 * (present / 3));
+    const confidence = clamp01(0.4 + 0.5 * infoStrength);
+
+    return res.json({
+      primary,
+      polarity,  // one of: pos/neu/neg
+      valence,   // -1..1 (neg..pos)
+      arousal,   // 0..1 (low..high)
+      confidence,
+      features: { f0_mean: f0, rms_mean: rms, speech_rate: rate, transcript }
+    });
+  } catch (err) {
+    return jsonError(res, 500, "Emotion analyze error", { detail: err?.message || String(err) });
+  }
 });
 
 app.listen(Number(PORT), () => {

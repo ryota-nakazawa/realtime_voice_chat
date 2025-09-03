@@ -181,6 +181,105 @@
       if (vadSrc) { try { vadSrc.disconnect(); } catch {} vadSrc = null; }
     }
 
+    // ========= Mic feature extraction (RMS / F0 / speech rate) =========
+    let micSrc = null, micAnalyser = null, micInterval = null;
+    const micFrames = []; // { ts, rms, f0 }
+    const USER_DELTA_HISTORY = []; // { ts, len }
+    let lastFinalUserText = "";
+
+    function computeRMS(floatBuf) {
+      let sum = 0;
+      for (let i = 0; i < floatBuf.length; i++) {
+        const v = floatBuf[i] || 0;
+        sum += v * v;
+      }
+      return Math.sqrt(sum / (floatBuf.length || 1));
+    }
+
+    function estimateF0ACF(floatBuf, sampleRate) {
+      // naive autocorrelation pitch estimator in 50..400 Hz
+      const minF = 50, maxF = 400;
+      const minLag = Math.floor(sampleRate / maxF);
+      const maxLag = Math.floor(sampleRate / minF);
+      const size = floatBuf.length;
+      if (!size || maxLag >= size) return 0;
+      // remove DC
+      let mean = 0;
+      for (let i = 0; i < size; i++) mean += floatBuf[i];
+      mean /= size;
+      const buf = new Float32Array(size);
+      for (let i = 0; i < size; i++) buf[i] = floatBuf[i] - mean;
+      // compute ACF
+      let bestLag = 0, bestVal = 0;
+      for (let lag = minLag; lag <= maxLag; lag++) {
+        let sum = 0;
+        for (let i = 0; i < size - lag; i++) sum += buf[i] * buf[i + lag];
+        if (sum > bestVal) { bestVal = sum; bestLag = lag; }
+      }
+      if (bestLag <= 0) return 0;
+      const f0 = sampleRate / bestLag;
+      return (f0 >= minF && f0 <= maxF) ? f0 : 0;
+    }
+
+    function setupMicAnalysis(stream) {
+      try {
+        if (!audioCtx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          audioCtx = new AC();
+        }
+        audioCtx.resume?.();
+        if (micSrc) { try { micSrc.disconnect(); } catch {} micSrc = null; }
+        if (!micAnalyser) {
+          micAnalyser = audioCtx.createAnalyser();
+          micAnalyser.fftSize = 2048;
+          micAnalyser.smoothingTimeConstant = 0.02;
+        }
+        micSrc = audioCtx.createMediaStreamSource(stream);
+        micSrc.connect(micAnalyser);
+
+        const floatBuf = new Float32Array(micAnalyser.fftSize);
+        const intervalMs = 100;
+        if (micInterval) { clearInterval(micInterval); micInterval = null; }
+        micInterval = setInterval(() => {
+          try {
+            micAnalyser.getFloatTimeDomainData(floatBuf);
+            const rms = computeRMS(floatBuf);
+            const f0 = estimateF0ACF(floatBuf, audioCtx.sampleRate || 44100);
+            micFrames.push({ ts: performance.now(), rms, f0 });
+            // keep last 10s
+            const cutoff = performance.now() - 10_000;
+            while (micFrames.length && micFrames[0].ts < cutoff) micFrames.shift();
+            // also trim user delta history
+            while (USER_DELTA_HISTORY.length && USER_DELTA_HISTORY[0].ts < cutoff) USER_DELTA_HISTORY.shift();
+          } catch {}
+        }, intervalMs);
+      } catch (err) {
+        console.warn("Mic analysis setup failed:", err?.message || err);
+      }
+    }
+
+    function teardownMicAnalysis() {
+      if (micInterval) { clearInterval(micInterval); micInterval = null; }
+      if (micSrc) { try { micSrc.disconnect(); } catch {} micSrc = null; }
+    }
+
+    function getFeatureSummary(windowMs = 2000) {
+      const now = performance.now();
+      const from = now - windowMs;
+      const frames = micFrames.filter(f => f.ts >= from);
+      let f0_mean = 0, rms_mean = 0;
+      if (frames.length) {
+        for (const f of frames) { f0_mean += (f.f0 || 0); rms_mean += (f.rms || 0); }
+        f0_mean /= frames.length;
+        rms_mean /= frames.length;
+      }
+      // characters per second over the same window
+      let chars = 0;
+      for (const d of USER_DELTA_HISTORY) if (d.ts >= from) chars += (d.len || 0);
+      const speech_rate = windowMs > 0 ? chars / (windowMs / 1000) : 0;
+      return { f0_mean, rms_mean, speech_rate };
+    }
+
     // ========= WebRTC session =========
     let pc = null, dc = null, micStream = null, remoteAudio = null;
     let running = false, cleaning = false;
@@ -216,6 +315,8 @@
           audioCtx = new AC();
           await audioCtx.resume();
         }
+        // Start mic feature extraction
+        setupMicAnalysis(micStream);
 
         const session = await fetchEphemeralSession();
         pc = new RTCPeerConnection({
@@ -243,7 +344,7 @@
             dc.send(JSON.stringify({
               type: "response.create",
               response: {
-                instructions: "原則日本語で簡潔に回答。一般知識・技術解説・定義・事実確認などの『知識質問』に答える前に必ず search_kb を1回呼び、上位ヒットを根拠に回答し、少なくとも1件の出典（タイトルとURL）を短く明示。天気は get_weather を使用。ヒット0件ならその旨と絞り込み提案。推測やハルシネーションは避ける。",
+                instructions: "原則日本語で簡潔に回答。知識系の質問は必ず search_kb を1回呼び、上位ヒットを根拠に回答し、少なくとも1件の出典（タイトルとURL）を短く明示。天気は get_weather を使用。ユーザの各発話が確定するたびに analyze_emotion を必ず1回呼び、直近の音声特徴・テキストから感情(推定)を簡潔に要約し、語調を調整する。ヒット0件ならその旨と絞り込み提案。推測やハルシネーションは避ける。",
                 modalities: ["text", "audio"],
                 input_text: "テストです。まずは短く自己紹介し、続いて『東京の天気』の例と、『Function Calling や RAG とは？』の例を示してください。"
               }
@@ -284,6 +385,7 @@
                 liveUserRow.style.display = "block";
                 liveUserTextEl.textContent = currentUserText;
                 logEl.scrollTop = logEl.scrollHeight;
+                USER_DELTA_HISTORY.push({ ts: performance.now(), len: userDelta.length });
               }
 
               // ===== Function Calling: arguments delta =====
@@ -340,9 +442,34 @@
               if (userDone) {
                 const finalUserText = (e?.transcript?.text || currentUserText || "").trim();
                 if (finalUserText) addMessage("user", finalUserText);
+                lastFinalUserText = finalUserText || lastFinalUserText;
                 currentUserText = "";
                 liveUserTextEl.textContent = "";
                 liveUserRow.style.display = "none";
+
+                // 毎発話で必ず analyze_emotion を要求する
+                try {
+                  if (finalUserText) {
+                    const summary = getFeatureSummary(2500);
+                    const args = {
+                      f0_mean: Number(summary.f0_mean || 0),
+                      rms_mean: Number(summary.rms_mean || 0),
+                      speech_rate: Number(summary.speech_rate || 0),
+                      transcript: finalUserText
+                    };
+                    const argsStr = JSON.stringify(args);
+                    dc?.send(JSON.stringify({
+                      type: "response.create",
+                      response: {
+                        instructions: `直前のユーザ発話に対して analyze_emotion ツールを必ず1回呼び出してください。引数は次のJSONをそのまま使ってください: ${argsStr}。ツールの出力({primary,valence,arousal,confidence})を短く要約し、それを踏まえて丁寧に応答してください。`,
+                        modalities: ["text", "audio"],
+                        input_text: "感情推定を実行してください。"
+                      }
+                    }));
+                  }
+                } catch (err) {
+                  console.warn("force analyze_emotion failed:", err?.message || err);
+                }
               }
             } catch { /* 非JSONは無視 */ }
           };
@@ -415,6 +542,7 @@
         liveUserRow.style.display = "none";
 
         teardownVAD();
+        teardownMicAnalysis();
         stopAvatarSpeaking(true);
 
         if (!silent) addMessage("event", "Session stopped");
@@ -425,10 +553,25 @@
     }
 
     // ========= Tool implementations =========
+    function normalizeToolName(s) {
+      try {
+        return (s || "")
+          .toString()
+          .normalize("NFKC")
+          .toLowerCase()
+          .replace(/[\u200B\u200C\u200D]/g, "") // zero-width chars
+          .trim()
+          .replace(/^functions?\./, "")
+          .replace(/[\s\-]+/g, "_");
+      } catch { return (s || "").toString().trim().toLowerCase(); }
+    }
+
     async function handleToolCall(name, callId, args) {
       try {
         let output = {};
-        switch (name) {
+        const toolName = normalizeToolName(name);
+        // console.debug("tool name raw=", name, " normalized=", toolName);
+        switch (toolName) {
           case "get_weather": {
             const { city = "東京", unit = "c" } = args || {};
             // 実運用ではバックエンドAPIや外部天気APIを呼ぶ
@@ -457,8 +600,59 @@
             }
             break;
           }
+          case "analyze_emotion": {
+            const summary = getFeatureSummary(2500);
+            const payload = {
+              f0_mean: Number.isFinite(args?.f0_mean) ? args.f0_mean : summary.f0_mean,
+              rms_mean: Number.isFinite(args?.rms_mean) ? args.rms_mean : summary.rms_mean,
+              speech_rate: Number.isFinite(args?.speech_rate) ? args.speech_rate : summary.speech_rate,
+              transcript: (args?.transcript || lastFinalUserText || currentUserText || "").toString()
+            };
+            try {
+              const r = await fetch("/emotion/analyze", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+              });
+              if (!r.ok) {
+                const t = await r.text().catch(() => "");
+                output = { error: `analyze_emotion failed: ${r.status} ${t.slice(0,200)}` };
+              } else {
+                output = await r.json();
+              }
+            } catch (e) {
+              output = { error: `analyze_emotion error: ${(e?.message || e)}` };
+            }
+            break;
+          }
           default:
-            output = { error: `Unknown tool: ${name}` };
+            if (toolName.includes("emotion")) {
+              // Fallback mapping for variants like "analyze emotion", "functions.analyze-emotion" etc.
+              const summary = getFeatureSummary(2500);
+              const payload = {
+                f0_mean: Number.isFinite(args?.f0_mean) ? args.f0_mean : summary.f0_mean,
+                rms_mean: Number.isFinite(args?.rms_mean) ? args.rms_mean : summary.rms_mean,
+                speech_rate: Number.isFinite(args?.speech_rate) ? args.speech_rate : summary.speech_rate,
+                transcript: (args?.transcript || lastFinalUserText || currentUserText || "").toString()
+              };
+              try {
+                const r = await fetch("/emotion/analyze", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(payload)
+                });
+                if (!r.ok) {
+                  const t = await r.text().catch(() => "");
+                  output = { error: `analyze_emotion failed: ${r.status} ${t.slice(0,200)}` };
+                } else {
+                  output = await r.json();
+                }
+              } catch (e) {
+                output = { error: `analyze_emotion error: ${(e?.message || e)}` };
+              }
+            } else {
+              output = { error: `Unknown tool: ${name}` };
+            }
         }
 
         // 1) function_call_output を会話に注入（call_id を必ず一致）
@@ -470,6 +664,19 @@
             output: JSON.stringify(output)
           }
         }));
+
+        if (toolName === "analyze_emotion") {
+          const fmt = (n, d = 2) => (Number.isFinite(Number(n)) ? Number(n).toFixed(d) : "-");
+          const val = Number(output?.valence);
+          const pol = String(output?.polarity || (Number.isFinite(val) ? (val > 0.15 ? "pos" : (val < -0.15 ? "neg" : "neu")) : "neu")).toUpperCase();
+          const ar = Number(output?.arousal);
+          const conf = Number(output?.confidence);
+          const prim = output?.primary || "unknown";
+          const f0 = Number(output?.features?.f0_mean);
+          const rms = Number(output?.features?.rms_mean);
+          const rate = Number(output?.features?.speech_rate);
+          addMessage("event", `emotion: [${pol}] ${prim} | v=${fmt(val)} a=${fmt(ar)} c=${fmt(conf)} | f0=${fmt(f0)}Hz rms=${fmt(rms,3)} rate=${fmt(rate)}/s`);
+        }
 
         addMessage("event", `tool_output: ${name} -> ${JSON.stringify(output)}`);
 
